@@ -38,10 +38,10 @@ namespace Coflnet.Kafka.Dedup
         static async Task Main(string[] args)
         {
             int batchSize = 50;
-            if(int.TryParse(SimplerConfig.Config.Instance["BATCH_SIZE"],out int size))
+            if (int.TryParse(SimplerConfig.Config.Instance["BATCH_SIZE"], out int size))
                 batchSize = size;
             int msWaitTime = 10;
-            if(int.TryParse(SimplerConfig.Config.Instance["BATCH_WAIT_TIME"],out int time))
+            if (int.TryParse(SimplerConfig.Config.Instance["BATCH_WAIT_TIME"], out int time))
                 msWaitTime = time;
 
             var batch = new List<ConsumeResult<string, Carrier>>();
@@ -71,16 +71,15 @@ namespace Coflnet.Kafka.Dedup
                                     batch.Add(cr);
                                     if (cr.TopicPartitionOffset.Offset % (batchSize * 10) == 0)
                                         Console.WriteLine($"Consumed message '{cr.Message.Key}' at: '{cr.TopicPartitionOffset}'.");
-
                                 }
-                                if(batch.Count == 0)
+                                if (batch.Count == 0)
                                     continue;
                                 // remove dupplicates
                                 var unduplicated = batch.GroupBy(x => x.Message.Key).Select(y => y.First());
 
                                 Parallel.ForEach(unduplicated, async (source, state, index) =>
                                 {
-                                    if(source.Message.Key == null)
+                                    if (source.Message.Key == null)
                                     {
                                         await p.ProduceAsync(produceIntoTopic, source.Message);
                                         return;
@@ -90,7 +89,7 @@ namespace Coflnet.Kafka.Dedup
                                     {
                                         var result = await p.ProduceAsync(produceIntoTopic, source.Message);
                                         await db.StringSetAsync(source.Message.Key, "", TimeSpan.FromSeconds(3600));
-                                        if(result.Offset % (batchSize * 10) == 0)
+                                        if (result.Offset % (batchSize * 10) == 0)
                                             Console.WriteLine("Delivery offset: " + result.Offset);
                                     }
                                 });
@@ -110,7 +109,6 @@ namespace Coflnet.Kafka.Dedup
                         c.Close();
                     }
                 }
-
             }
         }
 
@@ -137,7 +135,5 @@ namespace Coflnet.Kafka.Dedup
                 return new Carrier() { content = data.ToArray() };
             }
         }
-
     }
-
 }
