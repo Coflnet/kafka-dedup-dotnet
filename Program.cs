@@ -87,10 +87,12 @@ namespace Coflnet.Kafka.Dedup
                                     var exists = await db.KeyExistsAsync(source.Message.Key);
                                     if (!exists)
                                     {
-                                        var result = await p.ProduceAsync(produceIntoTopic, source.Message);
+                                        p.Produce(produceIntoTopic, source.Message, result =>
+                                        {
+                                            if (result.Offset % (batchSize * 10) == 0)
+                                                Console.WriteLine("Delivery offset: " + result.Offset);
+                                        });
                                         await db.StringSetAsync(source.Message.Key, "", TimeSpan.FromSeconds(3600));
-                                        if (result.Offset % (batchSize * 10) == 0)
-                                            Console.WriteLine("Delivery offset: " + result.Offset);
                                     }
                                 });
                                 // tell kafka that we stored the batch
