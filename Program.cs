@@ -24,10 +24,11 @@ namespace Coflnet.Kafka.Dedup
         };
         private static string produceIntoTopic = SimplerConfig.Config.Instance["TARGET_TOPIC"];
         private static string sourceTopic = SimplerConfig.Config.Instance["SOURCE_TOPIC"];
+        static int batchSize = 50;
 
-        static Action<DeliveryReport<Null, Carrier>> handler = r =>
+        static Action<DeliveryReport<string, Carrier>> handler = r =>
             {
-                if (r.Error.IsError || r.TopicPartitionOffset.Offset % 200 == 0)
+                if (r.Error.IsError || r.TopicPartitionOffset.Offset % (batchSize * 10) == 0)
                     Console.WriteLine(!r.Error.IsError
                         ? $"Delivered {r.Topic} {r.Offset} "
                         : $"\nDelivery Error {r.Topic}: {r.Error.Reason}");
@@ -37,7 +38,6 @@ namespace Coflnet.Kafka.Dedup
 
         static async Task Main(string[] args)
         {
-            int batchSize = 50;
             if (int.TryParse(SimplerConfig.Config.Instance["BATCH_SIZE"], out int size))
                 batchSize = size;
             int msWaitTime = 10;
@@ -51,6 +51,7 @@ namespace Coflnet.Kafka.Dedup
             RedisConnection = ConnectionMultiplexer.Connect(options);
 
             var db = RedisConnection.GetDatabase();
+            Task<bool> lastSave = null;
             using (var c = new ConsumerBuilder<string, Carrier>(consumerConfig).SetValueDeserializer(Deserializer.Instance).Build())
             {
                 using (var p = new ProducerBuilder<string, Carrier>(producerConfig).SetValueSerializer(Serializer.Instance).Build())
@@ -75,26 +76,29 @@ namespace Coflnet.Kafka.Dedup
                                 if (batch.Count == 0)
                                     continue;
                                 // remove dupplicates
-                                var unduplicated = batch.GroupBy(x => x.Message.Key).Select(y => y.First());
-
-                                Parallel.ForEach(unduplicated, async (source, state, index) =>
+                                var unduplicated = batch.GroupBy(x => x.Message.Key).Select(y => y.First()).ToList();
+                                if(lastSave != null)
+                                    await lastSave;
+                                    
+                                var result = await db.StringGetAsync(unduplicated.Where(k => k.Message.Key != null).Select(s => new RedisKey(s.Message.Key)).ToArray());
+                                foreach (var item in unduplicated.Where(k => k.Message.Key == null))
                                 {
-                                    if (source.Message.Key == null)
+                                    p.Produce(produceIntoTopic, item.Message, handler);
+                                }
+
+                                var trans = db.CreateTransaction();
+                                for (int i = 0; i < unduplicated.Count; i++)
+                                {
+                                    if (!result[i].HasValue)
                                     {
-                                        await p.ProduceAsync(produceIntoTopic, source.Message);
-                                        return;
+                                        var value = unduplicated[i];
+                                        p.Produce(produceIntoTopic, value.Message, handler);
+                                        trans.StringSetAsync(value.Message.Key, "1", TimeSpan.FromSeconds(3600));
                                     }
-                                    var exists = await db.KeyExistsAsync(source.Message.Key);
-                                    if (!exists)
-                                    {
-                                        p.Produce(produceIntoTopic, source.Message, result =>
-                                        {
-                                            if (result.Offset % (batchSize * 10) == 0)
-                                                Console.WriteLine("Delivery offset: " + result.Offset);
-                                        });
-                                        await db.StringSetAsync(source.Message.Key, "", TimeSpan.FromSeconds(3600));
-                                    }
-                                });
+                                }
+
+                                lastSave = trans.ExecuteAsync();
+
                                 // tell kafka that we stored the batch
                                 c.Commit(batch.Select(b => b.TopicPartitionOffset));
                                 batch.Clear();
