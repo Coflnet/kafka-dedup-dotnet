@@ -96,12 +96,14 @@ namespace Coflnet.Kafka.Dedup
                     {
                         var watch = Stopwatch.StartNew();
                         await lastSave;
-                        Console.WriteLine($"Save took {watch.Elapsed}");
+                        if (unduplicated.Count % 4 == 1)
+                            Console.WriteLine($"Save took {watch.Elapsed}");
                     }
 
                     var getWatch = Stopwatch.StartNew();
                     var result = await db.StringGetAsync(unduplicated.Where(k => k.Message.Key != null).Select(s => new RedisKey(s.Message.Key)).ToArray());
-                    Console.WriteLine($"Get {result.Length} took {getWatch.Elapsed} {DateTime.Now}");
+                    if (result.Length % 2 == 1)
+                        Console.WriteLine($"Get {result.Length} took {getWatch.Elapsed} {DateTime.Now}");
 
                     foreach (var item in unduplicated.Where(k => k.Message.Key == null))
                     {
