@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Linq;
@@ -13,7 +14,7 @@ namespace Coflnet.Kafka.Dedup
         private ProducerConfig producerConfig = new ProducerConfig { BootstrapServers = SimplerConfig.Config.Instance["KAFKA_HOST"] };
         private ConsumerConfig consumerConfig = new ConsumerConfig
         {
-            GroupId = "test-consumer-group",
+            GroupId = "deduper",
             BootstrapServers = SimplerConfig.Config.Instance["KAFKA_HOST"],
             // Note: The AutoOffsetReset property determines the start offset in the event
             // there are not yet any committed offsets for the consumer group for the
@@ -27,7 +28,7 @@ namespace Coflnet.Kafka.Dedup
         static int batchSize = 50;
         int msWaitTime = 10;
 
-        private Dictionary<string, short> Seen = new Dictionary<string, short>();
+        private ConcurrentDictionary<string, DateTime> Seen = new ConcurrentDictionary<string, DateTime>();
 
 
         Action<DeliveryReport<string, Carrier>> handler = r =>
@@ -41,6 +42,7 @@ namespace Coflnet.Kafka.Dedup
         public ConnectionMultiplexer RedisConnection { get; private set; }
         public async Task Run()
         {
+            Console.WriteLine("starting");
             if (int.TryParse(SimplerConfig.Config.Instance["BATCH_SIZE"], out int size))
                 batchSize = size;
             if (int.TryParse(SimplerConfig.Config.Instance["BATCH_WAIT_TIME"], out int time))
@@ -57,6 +59,7 @@ namespace Coflnet.Kafka.Dedup
                 using (var p = new ProducerBuilder<string, Carrier>(producerConfig).SetValueSerializer(Serializer.Instance).Build())
                 {
                     c.Subscribe(sourceTopic);
+                    Console.WriteLine("connected");
                     try
                     {
                         await DedupBatch(db, c, p);
@@ -70,6 +73,9 @@ namespace Coflnet.Kafka.Dedup
             }
         }
 
+        private string lastKey;
+        private int index = 0;
+
         public async Task DedupBatch(IDatabase db, IConsumer<string, Carrier> c, IProducer<string, Carrier> p)
         {
             Task<bool> lastSave = null;
@@ -78,11 +84,20 @@ namespace Coflnet.Kafka.Dedup
             {
                 try
                 {
+                    if (Seen.Count > 2000)
+                        foreach (var item in Seen.Where(s => s.Value < DateTime.Now - TimeSpan.FromMinutes(5)).Select(s => s.Key).ToList())
+                        {
+                            Seen.TryRemove(item, out _);
+                        }
                     while (batch.Count < batchSize)
                     {
-                        var cr = c.Consume(msWaitTime);
+                        var cr = c.Consume(msWaitTime * (index + 1));
                         if (cr == null)
+                        {
+                            index++;
                             break;
+                        }
+                        index = 0;
 
                         batch.Add(cr);
                         if (cr.TopicPartitionOffset.Offset % (batchSize * 10) == 0)
@@ -91,7 +106,17 @@ namespace Coflnet.Kafka.Dedup
                     if (batch.Count == 0)
                         continue;
                     // remove dupplicates
-                    var unduplicated = batch.GroupBy(x => x.Message.Key).Select(y => y.First()).ToList();
+                    var unduplicated = batch.GroupBy(x => x.Message.Key).Select(y => y.First()).Where(f => Seen.TryAdd(f.Message.Key, DateTime.Now)).ToList();
+                    if (unduplicated.Count == 0)
+                    {
+                        if (lastKey != batch.First().Message.Key)
+                        {
+                            lastKey = batch.First().Message.Key;
+                            Console.WriteLine("skip because duplicate " + lastKey);
+                        }
+                        continue; // no new keys
+                    }
+
                     if (lastSave != null)
                     {
                         var watch = Stopwatch.StartNew();
