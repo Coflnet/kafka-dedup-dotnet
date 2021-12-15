@@ -94,7 +94,8 @@ namespace Coflnet.Kafka.Dedup
                         var cr = c.Consume(msWaitTime * (index + 1));
                         if (cr == null)
                         {
-                            index++;
+                            if (index < 20)
+                                index++;
                             break;
                         }
                         index = 0;
