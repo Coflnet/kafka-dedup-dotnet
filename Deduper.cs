@@ -77,6 +77,7 @@ namespace Coflnet.Kafka.Dedup
         }
 
         private string lastKey;
+        private int a = 0;
 
         public async Task DedupBatch(IDatabase db, IConsumer<string, Carrier> c, IProducer<string, Carrier> p, CancellationToken stopToken)
         {
@@ -86,13 +87,16 @@ namespace Coflnet.Kafka.Dedup
             {
                 try
                 {
-                    if (Seen.Count > 2000)
-                        foreach (var item in Seen.Where(s => s.Value < DateTime.Now - TimeSpan.FromMinutes(5)).Select(s => s.Key).ToList())
-                        {
-                            Seen.TryRemove(item, out _);
-                        }
-
                     var next = c.Consume(stopToken);
+                    if (next.Message.Timestamp.UtcDateTime < DateTime.Now - TimeSpan.FromHours(14))
+                    {
+                        a++;
+                        if (a % 1000000 == 0)
+                            Console.WriteLine("1M");
+
+                        c.Commit(new Confluent.Kafka.TopicPartitionOffset[] { next.TopicPartitionOffset });
+                        continue;
+                    }
                     if (next != null)
                         batch.Add(next);
                     while (batch.Count < batchSize)
@@ -119,7 +123,7 @@ namespace Coflnet.Kafka.Dedup
                             Console.WriteLine("skip because duplicate " + lastKey);
                         }
 
-                        c.Commit(batch.Select(b => b.TopicPartitionOffset));
+                        ResetBatch(c, batch);
                         continue; // no new keys
                     }
 
@@ -155,14 +159,19 @@ namespace Coflnet.Kafka.Dedup
                     lastSave = trans.ExecuteAsync();
 
                     // tell kafka that we stored the batch
-                    c.Commit(batch.Select(b => b.TopicPartitionOffset));
-                    batch.Clear();
+                    ResetBatch(c, batch);
                 }
                 catch (ConsumeException e)
                 {
                     Console.WriteLine($"Error occured: {e.Error.Reason}");
                 }
             }
+        }
+
+        private static void ResetBatch(IConsumer<string, Carrier> c, List<ConsumeResult<string, Carrier>> batch)
+        {
+            c.Commit(batch.Select(b => b.TopicPartitionOffset));
+            batch.Clear();
         }
     }
 }
