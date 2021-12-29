@@ -3,6 +3,7 @@ using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Linq;
+using System.Threading;
 using System.Threading.Tasks;
 using Confluent.Kafka;
 using StackExchange.Redis;
@@ -40,7 +41,7 @@ namespace Coflnet.Kafka.Dedup
             };
 
         public ConnectionMultiplexer RedisConnection { get; private set; }
-        public async Task Run()
+        public async Task Run(CancellationToken stopToken)
         {
             Console.WriteLine("starting");
             if (int.TryParse(SimplerConfig.Config.Instance["BATCH_SIZE"], out int size))
@@ -62,24 +63,26 @@ namespace Coflnet.Kafka.Dedup
                     Console.WriteLine("connected");
                     try
                     {
-                        await DedupBatch(db, c, p);
+                        await DedupBatch(db, c, p, stopToken);
                     }
                     catch (OperationCanceledException)
                     {
-                        // Ensure the consumer leaves the group cleanly and final offsets are committed.
-                        c.Close();
                     }
+                    // Ensure the consumer leaves the group cleanly and final offsets are committed.
+                    c.Close();
+                    p.Flush();
+                    Console.WriteLine("stopping");
                 }
             }
         }
 
         private string lastKey;
 
-        public async Task DedupBatch(IDatabase db, IConsumer<string, Carrier> c, IProducer<string, Carrier> p)
+        public async Task DedupBatch(IDatabase db, IConsumer<string, Carrier> c, IProducer<string, Carrier> p, CancellationToken stopToken)
         {
             Task<bool> lastSave = null;
             var batch = new List<ConsumeResult<string, Carrier>>();
-            while (true)
+            while (!stopToken.IsCancellationRequested)
             {
                 try
                 {
@@ -89,7 +92,7 @@ namespace Coflnet.Kafka.Dedup
                             Seen.TryRemove(item, out _);
                         }
 
-                    var next = c.Consume(msWaitTime * 500);
+                    var next = c.Consume(stopToken);
                     if (next != null)
                         batch.Add(next);
                     while (batch.Count < batchSize)
@@ -107,7 +110,7 @@ namespace Coflnet.Kafka.Dedup
                     if (batch.Count == 0)
                         continue;
                     // remove dupplicates
-                    var unduplicated = batch.GroupBy(x => x.Message.Key).Select(y => y.First()).ToList();
+                    var unduplicated = batch.Where(m => m.Message.Timestamp.UtcDateTime > (DateTime.Now - TimeSpan.FromHours(3))).GroupBy(x => x.Message.Key).Select(y => y.First()).ToList();
                     if (unduplicated.Count == 0)
                     {
                         if (lastKey != batch.First().Message.Key)
