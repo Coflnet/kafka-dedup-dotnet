@@ -74,7 +74,6 @@ namespace Coflnet.Kafka.Dedup
         }
 
         private string lastKey;
-        private int index = 0;
 
         public async Task DedupBatch(IDatabase db, IConsumer<string, Carrier> c, IProducer<string, Carrier> p)
         {
@@ -89,16 +88,17 @@ namespace Coflnet.Kafka.Dedup
                         {
                             Seen.TryRemove(item, out _);
                         }
+
+                    var next = c.Consume(msWaitTime * 500);
+                    if (next != null)
+                        batch.Add(next);
                     while (batch.Count < batchSize)
                     {
-                        var cr = c.Consume(msWaitTime * (index + 1));
+                        var cr = c.Consume(TimeSpan.Zero);
                         if (cr == null)
                         {
-                            if (index < 20)
-                                index++;
                             break;
                         }
-                        index = 0;
 
                         batch.Add(cr);
                         if (cr.TopicPartitionOffset.Offset % (batchSize * 10) == 0)
@@ -107,7 +107,7 @@ namespace Coflnet.Kafka.Dedup
                     if (batch.Count == 0)
                         continue;
                     // remove dupplicates
-                    var unduplicated = batch.GroupBy(x => x.Message.Key).Select(y => y.First()).Where(f => Seen.TryAdd(f.Message.Key, DateTime.Now)).ToList();
+                    var unduplicated = batch.GroupBy(x => x.Message.Key).Select(y => y.First()).ToList();
                     if (unduplicated.Count == 0)
                     {
                         if (lastKey != batch.First().Message.Key)
@@ -115,6 +115,8 @@ namespace Coflnet.Kafka.Dedup
                             lastKey = batch.First().Message.Key;
                             Console.WriteLine("skip because duplicate " + lastKey);
                         }
+
+                        c.Commit(batch.Select(b => b.TopicPartitionOffset));
                         continue; // no new keys
                     }
 
