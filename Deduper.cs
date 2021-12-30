@@ -15,7 +15,7 @@ namespace Coflnet.Kafka.Dedup
         private ProducerConfig producerConfig = new ProducerConfig { BootstrapServers = SimplerConfig.Config.Instance["KAFKA_HOST"] };
         private ConsumerConfig consumerConfig = new ConsumerConfig
         {
-            GroupId = "deduper",
+            GroupId = "test-consumer-group",
             BootstrapServers = SimplerConfig.Config.Instance["KAFKA_HOST"],
             // Note: The AutoOffsetReset property determines the start offset in the event
             // there are not yet any committed offsets for the consumer group for the
