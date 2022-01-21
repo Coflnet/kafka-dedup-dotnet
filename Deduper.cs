@@ -113,13 +113,17 @@ namespace Coflnet.Kafka.Dedup
                     }
                     if (batch.Count == 0)
                         continue;
+
+                    var targetBatch = batch;
+                    batch = new List<ConsumeResult<string, Carrier>>();
+
                     // remove dupplicates
                     _ = Task.Run(async () =>
                     {
                         for (int i = 0; i < 3; i++)
                             try
                             {
-                                await NewMethod(db, c, p, batch);
+                                await NewMethod(db, c, p, targetBatch);
 
 
                                 if (Seen.Count > 1000)
