@@ -8,4 +8,4 @@ REDIS_PASSWORD
 SOURCE_TOPIC  
 TARGET_TOPIC  
 BATCH_SIZE  (default 50)  
-BATCH_WAIT_TIME  (default 10 ms)  
+BATCH_WAIT_TIME  (default 10 ms)
