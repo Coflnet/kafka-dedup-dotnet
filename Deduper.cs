@@ -6,12 +6,15 @@ using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
 using Confluent.Kafka;
+using Prometheus;
 using StackExchange.Redis;
 
 namespace Coflnet.Kafka.Dedup
 {
     class Deduper
     {
+        private readonly static Counter MessagesAcknowledged = Metrics.CreateCounter("deduper_acknowledged", "How many messages were acknowledged");
+        private readonly static Gauge CurrentOffset = Metrics.CreateGauge("dedup_consume_offset", "The consumer group offset");
         private ProducerConfig producerConfig = new ProducerConfig { BootstrapServers = SimplerConfig.Config.Instance["KAFKA_HOST"] };
         private ConsumerConfig consumerConfig = new ConsumerConfig
         {
@@ -39,6 +42,7 @@ namespace Coflnet.Kafka.Dedup
                     Console.WriteLine(!r.Error.IsError
                         ? $"Delivered {r.Topic} {r.Offset} "
                         : $"\nDelivery Error {r.Topic}: {r.Error.Reason}");
+                MessagesAcknowledged.Inc();
             };
 
         public ConnectionMultiplexer RedisConnection { get; private set; }
@@ -49,6 +53,9 @@ namespace Coflnet.Kafka.Dedup
                 batchSize = size;
             if (int.TryParse(SimplerConfig.Config.Instance["BATCH_WAIT_TIME"], out int time))
                 msWaitTime = time;
+
+            var server = new MetricServer(port: 8000);
+            server.Start();
 
             ConfigurationOptions options = ConfigurationOptions.Parse(SimplerConfig.Config.Instance["REDIS_HOST"]);
             options.Password = SimplerConfig.Config.Instance["REDIS_PASSWORD"];
@@ -116,6 +123,7 @@ namespace Coflnet.Kafka.Dedup
 
                     var targetBatch = batch;
                     batch = new List<ConsumeResult<string, Carrier>>();
+                    CurrentOffset.Set(targetBatch.Last().TopicPartitionOffset.Offset);
 
                     // remove dupplicates
                     _ = Task.Run(async () =>
