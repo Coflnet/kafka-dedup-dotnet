@@ -123,10 +123,10 @@ namespace Coflnet.Kafka.Dedup
                         for (int i = 0; i < 3; i++)
                             try
                             {
-                                await NewMethod(db, c, p, targetBatch);
+                                await DeduplicateAndProduce(db, c, p, targetBatch);
 
 
-                                if (Seen.Count > 1000)
+                                if (Seen.Count > batchSize * 20)
                                 {
                                     // everything older than a minute has to be in redis by now
                                     var toRemove = Seen.Where(s => s.Value < DateTime.Now - TimeSpan.FromMinutes(1)).Select(s => s.Key).ToList();
@@ -142,7 +142,7 @@ namespace Coflnet.Kafka.Dedup
                             {
                                 Console.WriteLine($"failed to save {e.Message}\n{e.StackTrace}");
                             }
-                    });
+                    }).ConfigureAwait(false);
                 }
                 catch (ConsumeException e)
                 {
@@ -151,7 +151,7 @@ namespace Coflnet.Kafka.Dedup
             }
         }
 
-        private async Task NewMethod(IDatabase db, IConsumer<string, Carrier> c, IProducer<string, Carrier> p, List<ConsumeResult<string, Carrier>> batch)
+        private async Task DeduplicateAndProduce(IDatabase db, IConsumer<string, Carrier> c, IProducer<string, Carrier> p, List<ConsumeResult<string, Carrier>> batch)
         {
             var unduplicated = batch.Where(m => m.Message.Timestamp.UtcDateTime > (DateTime.Now - TimeSpan.FromHours(3)))
                                                 .Where(m => Seen.TryAdd(m.Message.Key, DateTime.Now)).GroupBy(x => x.Message.Key).Select(y => y.First()).ToList();
@@ -168,7 +168,7 @@ namespace Coflnet.Kafka.Dedup
                 //continue; 
             }
             var getWatch = Stopwatch.StartNew();
-            var result = await db.StringGetAsync(unduplicated.Where(k => k.Message.Key != null).Select(s => new RedisKey(s.Message.Key)).ToArray());
+            var result = await db.StringGetAsync(unduplicated.Where(k => k.Message.Key != null).Select(s => new RedisKey(s.Message.Key)).ToArray()).ConfigureAwait(false);
             if (result.Length % 2 == 1)
                 Console.WriteLine($"Get {result.Length} took {getWatch.Elapsed} {DateTime.Now}");
 
@@ -184,13 +184,13 @@ namespace Coflnet.Kafka.Dedup
                 {
                     var value = unduplicated[i];
                     p.Produce(produceIntoTopic, value.Message, handler);
-                    trans.StringSetAsync(value.Message.Key, "1", TimeSpan.FromSeconds(3600));
+                    _ = trans.StringSetAsync(value.Message.Key, "1", TimeSpan.FromSeconds(3600)).ConfigureAwait(false);
                 }
             }
 
 
             var watch = Stopwatch.StartNew();
-            await trans.ExecuteAsync();
+            await trans.ExecuteAsync().ConfigureAwait(false);
             if (unduplicated.Count % 4 == 1)
                 Console.WriteLine($"Save took {watch.Elapsed}");
 
