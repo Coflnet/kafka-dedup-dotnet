@@ -31,7 +31,6 @@ namespace Coflnet.Kafka.Dedup
         private string produceIntoTopic = SimplerConfig.Config.Instance["TARGET_TOPIC"];
         private string sourceTopic = SimplerConfig.Config.Instance["SOURCE_TOPIC"];
         static int batchSize = 50;
-        int msWaitTime = 10;
 
         private ConcurrentDictionary<string, DateTime> Seen = new ConcurrentDictionary<string, DateTime>();
 
@@ -51,8 +50,6 @@ namespace Coflnet.Kafka.Dedup
             Console.WriteLine("starting");
             if (int.TryParse(SimplerConfig.Config.Instance["BATCH_SIZE"], out int size))
                 batchSize = size;
-            if (int.TryParse(SimplerConfig.Config.Instance["BATCH_WAIT_TIME"], out int time))
-                msWaitTime = time;
 
             var server = new MetricServer(port: 8000);
             server.Start();
