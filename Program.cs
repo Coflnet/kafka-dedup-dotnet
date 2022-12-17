@@ -1,5 +1,5 @@
 ﻿using System;
-using System.Collections;
+using Prometheus;
 using System.Threading;
 using System.Threading.Tasks;
 
@@ -12,6 +12,8 @@ namespace Coflnet.Kafka.Dedup
         static async Task Main(string[] args)
         {
             var stopSource = new CancellationTokenSource();
+            var server = new MetricServer(port: 8000);
+            server.Start();
             
             Console.CancelKeyPress += delegate
             {
