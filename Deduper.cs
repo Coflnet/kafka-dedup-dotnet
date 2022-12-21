@@ -27,6 +27,7 @@ namespace Coflnet.Kafka.Dedup
             // automatically, so in this example, consumption will only start from the
             // earliest message in the topic 'my-topic' the first time you run the program.
             AutoOffsetReset = AutoOffsetReset.Earliest,
+            SessionTimeoutMs = 5_000,
             EnableAutoCommit = false // everything is commited explicitly
         };
         private string produceIntoTopic = SimplerConfig.Config.Instance["TARGET_TOPIC"];
@@ -112,6 +113,8 @@ namespace Coflnet.Kafka.Dedup
                     CurrentOffset.Set(targetBatch.Last().TopicPartitionOffset.Offset);
 
                     RemoveDupplicates(db, c, p, targetBatch);
+                    if(semaphore.CurrentCount == 0)
+                        await Task.Delay(30);
                 }
                 catch (ConsumeException e)
                 {
@@ -119,7 +122,7 @@ namespace Coflnet.Kafka.Dedup
                 }
             }
         }
-
+        SemaphoreSlim semaphore = new SemaphoreSlim(20);
         private void RemoveDupplicates(IDatabase db, IConsumer<string, Carrier> c, IProducer<string, Carrier> p, List<ConsumeResult<string, Carrier>> targetBatch)
         {
             _ = Task.Run(async () =>
@@ -127,12 +130,17 @@ namespace Coflnet.Kafka.Dedup
                 for (int i = 0; i < 3; i++)
                     try
                     {
+                        await semaphore.WaitAsync();
                         await ProcessBatch(db, c, p, targetBatch);
                         return;
                     }
                     catch (Exception e)
                     {
                         Console.WriteLine($"failed to save {e.Message}\n{e.StackTrace}");
+                    }
+                    finally
+                    {
+                        semaphore.Release();
                     }
             }).ConfigureAwait(false);
         }
