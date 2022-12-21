@@ -51,9 +51,6 @@ namespace Coflnet.Kafka.Dedup
             if (int.TryParse(SimplerConfig.Config.Instance["BATCH_SIZE"], out int size))
                 batchSize = size;
 
-            var server = new MetricServer(port: 8000);
-            server.Start();
-
             ConfigurationOptions options = ConfigurationOptions.Parse(SimplerConfig.Config.Instance["REDIS_HOST"]);
             options.Password = SimplerConfig.Config.Instance["REDIS_PASSWORD"];
             //options.AsyncTimeout = 200;
