@@ -1,5 +1,5 @@
 # First stage
-FROM mcr.microsoft.com/dotnet/sdk:5.0 AS build
+FROM mcr.microsoft.com/dotnet/sdk:7.0 AS build
 WORKDIR /build
 
 COPY kafka-dedup-dotnet.csproj .
@@ -9,7 +9,7 @@ COPY . .
 RUN dotnet publish -c release -o /app
 
 # Final stage
-FROM mcr.microsoft.com/dotnet/runtime:5.0
+FROM mcr.microsoft.com/dotnet/runtime:7.0
 WORKDIR /app
 COPY --from=build /app ./
 
