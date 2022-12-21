@@ -27,7 +27,7 @@ namespace Coflnet.Kafka.Dedup
             // automatically, so in this example, consumption will only start from the
             // earliest message in the topic 'my-topic' the first time you run the program.
             AutoOffsetReset = AutoOffsetReset.Earliest,
-            SessionTimeoutMs = 5_000,
+            SessionTimeoutMs = 7_000,
             EnableAutoCommit = false // everything is commited explicitly
         };
         private string produceIntoTopic = SimplerConfig.Config.Instance["TARGET_TOPIC"];
@@ -123,6 +123,7 @@ namespace Coflnet.Kafka.Dedup
             }
         }
         SemaphoreSlim semaphore = new SemaphoreSlim(20);
+        SemaphoreSlim removalLock = new SemaphoreSlim(1);
         private void RemoveDupplicates(IDatabase db, IConsumer<string, Carrier> c, IProducer<string, Carrier> p, List<ConsumeResult<string, Carrier>> targetBatch)
         {
             _ = Task.Run(async () =>
@@ -162,15 +163,31 @@ namespace Coflnet.Kafka.Dedup
 
             if (Seen.Count > batchSize * 20)
             {
-                // everything older than a minute has to be in redis by now
-                var toRemove = Seen.Where(s => s.Value < DateTime.Now - TimeSpan.FromMinutes(1)).Select(s => s.Key).ToList();
-                foreach (var item in toRemove)
+                if(removalLock.CurrentCount == 0)
+                    return;
+                await removalLock.WaitAsync();
+                try
                 {
-                    Seen.Remove(item, out DateTime _);
+                    RemoveOld();
                 }
-                Console.WriteLine("Removed " + toRemove.Count);
+                finally
+                {
+                    removalLock.Release();
+                }
             }
             return;
+        }
+
+        private void RemoveOld()
+        {
+
+            // everything older than a minute has to be in redis by now
+            var toRemove = Seen.Where(s => s.Value < DateTime.Now - TimeSpan.FromSeconds(10)).Select(s => s.Key).ToList();
+            foreach (var item in toRemove)
+            {
+                Seen.Remove(item, out DateTime _);
+            }
+            Console.WriteLine("Removed " + toRemove.Count);
         }
 
         private async Task DeduplicateAndProduce(IDatabase db, IConsumer<string, Carrier> c, IProducer<string, Carrier> p, List<ConsumeResult<string, Carrier>> batch)
