@@ -14,6 +14,7 @@ namespace Coflnet.Kafka.Dedup
     class Deduper
     {
         private readonly static Counter MessagesAcknowledged = Metrics.CreateCounter("deduper_acknowledged", "How many messages were acknowledged");
+        private readonly static Counter OldMessagesDropped = Metrics.CreateCounter("deduper_dropped", "How many messages were dropped because to old");
         private readonly static Gauge CurrentOffset = Metrics.CreateGauge("dedup_consume_offset", "The consumer group offset");
         private ProducerConfig producerConfig = new ProducerConfig { BootstrapServers = SimplerConfig.Config.Instance["KAFKA_HOST"] };
         private ConsumerConfig consumerConfig = new ConsumerConfig
@@ -89,15 +90,6 @@ namespace Coflnet.Kafka.Dedup
                 try
                 {
                     var next = c.Consume(stopToken);
-                    if (next.Message.Timestamp.UtcDateTime < DateTime.Now - TimeSpan.FromHours(14))
-                    {
-                        a++;
-                        if (a % 1000000 == 0)
-                            Console.WriteLine("1M");
-
-                        c.Commit(new Confluent.Kafka.TopicPartitionOffset[] { next.TopicPartitionOffset });
-                        continue;
-                    }
                     if (next != null)
                         batch.Add(next);
                     while (batch.Count < batchSize)
@@ -119,38 +111,58 @@ namespace Coflnet.Kafka.Dedup
                     batch = new List<ConsumeResult<string, Carrier>>();
                     CurrentOffset.Set(targetBatch.Last().TopicPartitionOffset.Offset);
 
-                    // remove dupplicates
-                    _ = Task.Run(async () =>
-                    {
-                        for (int i = 0; i < 3; i++)
-                            try
-                            {
-                                await DeduplicateAndProduce(db, c, p, targetBatch);
-
-
-                                if (Seen.Count > batchSize * 20)
-                                {
-                                    // everything older than a minute has to be in redis by now
-                                    var toRemove = Seen.Where(s => s.Value < DateTime.Now - TimeSpan.FromMinutes(1)).Select(s => s.Key).ToList();
-                                    foreach (var item in toRemove)
-                                    {
-                                        Seen.Remove(item, out DateTime _);
-                                    }
-                                    Console.WriteLine("Removed " + toRemove.Count);
-                                }
-                                return;
-                            }
-                            catch (Exception e)
-                            {
-                                Console.WriteLine($"failed to save {e.Message}\n{e.StackTrace}");
-                            }
-                    }).ConfigureAwait(false);
+                    RemoveDupplicates(db, c, p, targetBatch);
                 }
                 catch (ConsumeException e)
                 {
                     Console.WriteLine($"Error occured: {e.Error.Reason}\n{e.StackTrace}");
                 }
             }
+        }
+
+        private void RemoveDupplicates(IDatabase db, IConsumer<string, Carrier> c, IProducer<string, Carrier> p, List<ConsumeResult<string, Carrier>> targetBatch)
+        {
+            _ = Task.Run(async () =>
+            {
+                for (int i = 0; i < 3; i++)
+                    try
+                    {
+                        await ProcessBatch(db, c, p, targetBatch);
+                        return;
+                    }
+                    catch (Exception e)
+                    {
+                        Console.WriteLine($"failed to save {e.Message}\n{e.StackTrace}");
+                    }
+            }).ConfigureAwait(false);
+        }
+
+        private async Task ProcessBatch(IDatabase db, IConsumer<string, Carrier> c, IProducer<string, Carrier> p, List<ConsumeResult<string, Carrier>> targetBatch)
+        {
+            if (targetBatch.All(m => m.Message.Timestamp.UtcDateTime < DateTime.Now - TimeSpan.FromHours(14)))
+            {
+                a++;
+                if (a % 1000 == 0)
+                    Console.WriteLine("1k dropped");
+                OldMessagesDropped.Inc(targetBatch.Count);
+                // tell kafka that we processed this batch
+                ResetBatch(c, targetBatch);
+                return;
+            }
+            await DeduplicateAndProduce(db, c, p, targetBatch);
+
+
+            if (Seen.Count > batchSize * 20)
+            {
+                // everything older than a minute has to be in redis by now
+                var toRemove = Seen.Where(s => s.Value < DateTime.Now - TimeSpan.FromMinutes(1)).Select(s => s.Key).ToList();
+                foreach (var item in toRemove)
+                {
+                    Seen.Remove(item, out DateTime _);
+                }
+                Console.WriteLine("Removed " + toRemove.Count);
+            }
+            return;
         }
 
         private async Task DeduplicateAndProduce(IDatabase db, IConsumer<string, Carrier> c, IProducer<string, Carrier> p, List<ConsumeResult<string, Carrier>> batch)
@@ -202,7 +214,7 @@ namespace Coflnet.Kafka.Dedup
 
         private static void ResetBatch(IConsumer<string, Carrier> c, List<ConsumeResult<string, Carrier>> batch)
         {
-            c.Commit(batch.Select(b => b.TopicPartitionOffset));
+            c.Commit(batch.Select(b => b.TopicPartitionOffset).ToList());
             batch.Clear();
         }
     }
