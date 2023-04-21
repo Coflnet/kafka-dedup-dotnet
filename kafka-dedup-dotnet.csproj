@@ -2,10 +2,17 @@
 
   <PropertyGroup>
     <OutputType>Exe</OutputType>
-    <TargetFramework>net5.0</TargetFramework>
+    <TargetFramework>net7.0</TargetFramework>
     <RootNamespace>kafka_dedup_dotnet</RootNamespace>
   </PropertyGroup>
 
+  <ItemGroup>
+    <PackageReference Include="prometheus-net" Version="6.0.0" />
+    <PackageReference Include="Confluent.Kafka" Version="1.7.0" />
+    <PackageReference Include="SimplerConfig" Version="1.0.4" />
+    <PackageReference Include="StackExchange.Redis" Version="2.2.62" />
+  </ItemGroup>
+  
   <ItemGroup Condition="'$(Configuration)' == 'Release'">
     <Compile Remove="**\*.Tests.cs" />
   </ItemGroup>
@@ -15,10 +22,5 @@
     <PackageReference Include="Microsoft.NET.Test.Sdk" Version="16.11.0" />
   </ItemGroup>
 
-  <ItemGroup>
-    <PackageReference Include="Confluent.Kafka" Version="1.7.0" />
-    <PackageReference Include="SimplerConfig" Version="1.0.4" />
-    <PackageReference Include="StackExchange.Redis" Version="2.2.62" />
-  </ItemGroup>
 
 </Project>
