@@ -6,14 +6,16 @@ using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
 using Confluent.Kafka;
+using Microsoft.Extensions.Configuration;
+using SimplerConfig;
 using StackExchange.Redis;
 
 namespace Coflnet.Kafka.Dedup
 {
     class Deduper
     {
-        private ProducerConfig producerConfig = new ProducerConfig { BootstrapServers = SimplerConfig.Config.Instance["KAFKA_HOST"] };
-        private ConsumerConfig consumerConfig = new ConsumerConfig
+        //private ProducerConfig producerConfig = new ProducerConfig { BootstrapServers = SimplerConfig.Config.Instance["KAFKA_HOST"] };
+        /*private ConsumerConfig consumerConfig = new ConsumerConfig
         {
             GroupId = "test-consumer-group",
             BootstrapServers = SimplerConfig.Config.Instance["KAFKA_HOST"],
@@ -24,9 +26,10 @@ namespace Coflnet.Kafka.Dedup
             // earliest message in the topic 'my-topic' the first time you run the program.
             AutoOffsetReset = AutoOffsetReset.Earliest,
             EnableAutoCommit = false // everything is commited explicitly
-        };
+        };*/
         private string produceIntoTopic = SimplerConfig.Config.Instance["TARGET_TOPIC"];
         private string sourceTopic = SimplerConfig.Config.Instance["SOURCE_TOPIC"];
+        private string GroupId = SimplerConfig.Config.Instance["GROUP_ID"] ?? "deduper";
         static int batchSize = 50;
         int msWaitTime = 10;
 
@@ -56,6 +59,18 @@ namespace Coflnet.Kafka.Dedup
             RedisConnection = ConnectionMultiplexer.Connect(options);
 
             var db = RedisConnection.GetDatabase();
+            var config = (SConfig.Instance as SConfig).AppSettings;
+            var clientconfig = GetClientConfig(config);
+            var consumerConfig = new ConsumerConfig(clientconfig)
+            {
+                GroupId = GroupId,
+                AutoOffsetReset = AutoOffsetReset.Earliest,
+                EnableAutoCommit = false // everything is commited explicitly
+            };
+            var producerConfig = new ProducerConfig(clientconfig)
+            {
+                LingerMs = msWaitTime
+            };
             using (var c = new ConsumerBuilder<string, Carrier>(consumerConfig).SetValueDeserializer(Deserializer.Instance).Build())
             {
                 using (var p = new ProducerBuilder<string, Carrier>(producerConfig).SetValueSerializer(Serializer.Instance).Build())
@@ -196,6 +211,35 @@ namespace Coflnet.Kafka.Dedup
 
             // tell kafka that we stored the batch
             ResetBatch(c, batch);
+        }
+
+        public static AdminClientConfig GetClientConfig(IConfiguration config)
+        {
+            var baseConfig = new AdminClientConfig
+            {
+                BootstrapServers = config["BROKERS"],
+                SslCaLocation = config["TLS:CA_LOCATION"],
+                SslCertificateLocation = config["TLS:CERTIFICATE_LOCATION"],
+                SslKeyLocation = config["TLS:KEY_LOCATION"],
+                SaslUsername = config["USERNAME"],
+                SaslPassword = config["PASSWORD"]
+            };
+            if (!string.IsNullOrEmpty(baseConfig.SaslUsername))
+            {
+                if (!string.IsNullOrEmpty(baseConfig.SslKeyLocation))
+                    baseConfig.SecurityProtocol = SecurityProtocol.SaslSsl;
+                else
+                    baseConfig.SecurityProtocol = SecurityProtocol.SaslPlaintext;
+                baseConfig.SaslMechanism = SaslMechanism.ScramSha256;
+            }
+            else
+            {
+                if (!string.IsNullOrEmpty(baseConfig.SslKeyLocation))
+                    baseConfig.SecurityProtocol = SecurityProtocol.Ssl;
+                else
+                    baseConfig.SecurityProtocol = SecurityProtocol.Plaintext;
+            }
+            return baseConfig;
         }
 
         private static void ResetBatch(IConsumer<string, Carrier> c, List<ConsumeResult<string, Carrier>> batch)
