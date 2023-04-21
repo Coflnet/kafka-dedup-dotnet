@@ -57,10 +57,7 @@ namespace Coflnet.Kafka.Dedup
                 AutoOffsetReset = AutoOffsetReset.Earliest,
                 EnableAutoCommit = false // everything is commited explicitly
             };
-            var producerConfig = new ProducerConfig(clientconfig)
-            {
-                LingerMs = msWaitTime
-            };
+            var producerConfig = new ProducerConfig(clientconfig);
             using (var c = new ConsumerBuilder<string, Carrier>(consumerConfig).SetValueDeserializer(Deserializer.Instance).Build())
             {
                 using (var p = new ProducerBuilder<string, Carrier>(producerConfig).SetValueSerializer(Serializer.Instance).Build())
