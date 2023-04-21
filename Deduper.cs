@@ -63,7 +63,7 @@ namespace Coflnet.Kafka.Dedup
                 using (var p = new ProducerBuilder<string, Carrier>(producerConfig).SetValueSerializer(Serializer.Instance).Build())
                 {
                     c.Subscribe(sourceTopic);
-                    Console.WriteLine("connected");
+                    Console.WriteLine($"connected with {c.Name} {GroupId}");
                     try
                     {
                         await DedupBatch(db, c, p, stopToken);
