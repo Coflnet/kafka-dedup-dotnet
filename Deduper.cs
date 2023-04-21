@@ -50,7 +50,7 @@ namespace Coflnet.Kafka.Dedup
 
             var db = RedisConnection.GetDatabase();
             var config = (SConfig.Instance as SConfig).AppSettings;
-            var clientconfig = GetClientConfig(config);
+            var clientconfig = GetClientConfig(config.GetSection("KAFKA"));
             var consumerConfig = new ConsumerConfig(clientconfig)
             {
                 GroupId = GroupId,
