@@ -1,4 +1,5 @@
 ﻿using System;
+using System.Linq;
 using Prometheus;
 using System.Threading;
 using System.Threading.Tasks;
@@ -21,6 +22,11 @@ namespace Coflnet.Kafka.Dedup
                 Console.WriteLine("stopping");
                 Thread.Sleep(500);
             };
+            if(args.Contains("--test"))
+            {
+                await new LoadTest().Run();
+                return;
+            }
 
             await new Deduper().Run(stopSource.Token);
         }
