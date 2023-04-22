@@ -13,8 +13,7 @@ namespace Coflnet.Kafka.Dedup
             var clientConfig = Deduper.GetClientConfig(config);
             using var p = new ProducerBuilder<string, Carrier>(clientConfig).SetValueSerializer(Serializer.Instance).Build();
             var topic = config["SOURCE_TOPIC"];
-            var messageCount = int.Parse(config["MESSAGE_COUNT"]);
-            var batchSize = int.Parse(config["BATCH_SIZE"]);
+            var messageCount = int.Parse(config["MESSAGE_COUNT"] ?? "100000");
             var random = new Random();
             for (int i = 0; i < messageCount; i++)
             {
