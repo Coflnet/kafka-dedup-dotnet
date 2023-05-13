@@ -23,6 +23,7 @@ namespace Coflnet.Kafka.Dedup
         private string sourceTopic = SimplerConfig.Config.Instance["SOURCE_TOPIC"];
         private string GroupId = SimplerConfig.Config.Instance["GROUP_ID"] ?? "deduper";
         static int batchSize = 50;
+        private static bool FatalError = false;
 
         private ConcurrentDictionary<string, DateTime> Seen = new ConcurrentDictionary<string, DateTime>();
 
@@ -32,7 +33,12 @@ namespace Coflnet.Kafka.Dedup
                 if (r.Error.IsError || r.TopicPartitionOffset.Offset % (batchSize * 10) == 0)
                     Console.WriteLine(!r.Error.IsError
                         ? $"Delivered {r.Topic} {r.Offset} "
-                        : $"\nDelivery Error {r.Topic}: {r.Error.Reason}");
+                        : $"\nDelivery Error {r.Topic}: {r.Error.Reason} {r.Error.IsFatal}");
+                if (r.Error.IsFatal)
+                {    
+                    Console.WriteLine("Fatal error " + r.Error.Reason);
+                    FatalError = true;
+                }
                 MessagesAcknowledged.Inc();
             };
 
@@ -87,6 +93,8 @@ namespace Coflnet.Kafka.Dedup
             var batch = new List<ConsumeResult<string, Carrier>>();
             while (!stopToken.IsCancellationRequested)
             {
+                if(FatalError)
+                    throw new Exception("Fatal error in kafka, abording to preserve data");
                 try
                 {
                     var next = c.Consume(stopToken);
@@ -112,7 +120,7 @@ namespace Coflnet.Kafka.Dedup
                     CurrentOffset.Set(targetBatch.Last().TopicPartitionOffset.Offset);
 
                     RemoveDupplicates(db, c, p, targetBatch);
-                    if(semaphore.CurrentCount == 0)
+                    if (semaphore.CurrentCount == 0)
                         await Task.Delay(30);
                 }
                 catch (ConsumeException e)
@@ -162,7 +170,7 @@ namespace Coflnet.Kafka.Dedup
 
             if (Seen.Count > batchSize * 20)
             {
-                if(removalLock.CurrentCount == 0)
+                if (removalLock.CurrentCount == 0)
                     return;
                 await removalLock.WaitAsync();
                 try
