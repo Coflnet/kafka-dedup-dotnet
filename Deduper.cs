@@ -60,6 +60,8 @@ namespace Coflnet.Kafka.Dedup
             {
                 GroupId = GroupId,
                 AutoOffsetReset = AutoOffsetReset.Earliest,
+                SessionTimeoutMs = 8000,
+                SocketTimeoutMs = 8000,
                 EnableAutoCommit = false // everything is commited explicitly
             };
             var producerConfig = new ProducerConfig(GetClientConfig(config.GetSection("KAFKA")));
