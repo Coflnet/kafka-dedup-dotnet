@@ -56,14 +56,13 @@ namespace Coflnet.Kafka.Dedup
 
             var db = RedisConnection.GetDatabase();
             var config = (SConfig.Instance as SConfig).AppSettings;
-            var clientconfig = GetClientConfig(config.GetSection("KAFKA"));
-            var consumerConfig = new ConsumerConfig(clientconfig)
+            var consumerConfig = new ConsumerConfig(GetClientConfig(config.GetSection("KAFKA")))
             {
                 GroupId = GroupId,
                 AutoOffsetReset = AutoOffsetReset.Earliest,
                 EnableAutoCommit = false // everything is commited explicitly
             };
-            var producerConfig = new ProducerConfig(clientconfig);
+            var producerConfig = new ProducerConfig(GetClientConfig(config.GetSection("KAFKA")));
             using (var c = new ConsumerBuilder<string, Carrier>(consumerConfig).SetValueDeserializer(Deserializer.Instance).Build())
             {
                 using (var p = new ProducerBuilder<string, Carrier>(producerConfig).SetValueSerializer(Serializer.Instance).Build())

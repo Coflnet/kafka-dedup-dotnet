@@ -10,7 +10,7 @@ namespace Coflnet.Kafka.Dedup
         public async Task Run()
         {
             var config = new ConfigurationBuilder().AddJsonFile("appsettings.json", true).AddEnvironmentVariables().Build();
-            var clientConfig = Deduper.GetClientConfig(config);
+            var clientConfig = Deduper.GetClientConfig(config.GetSection("KAFKA"));
             using var p = new ProducerBuilder<string, Carrier>(clientConfig).SetValueSerializer(Serializer.Instance).Build();
             var topic = config["SOURCE_TOPIC"];
             var messageCount = int.Parse(config["MESSAGE_COUNT"] ?? "100000");
@@ -20,7 +20,7 @@ namespace Coflnet.Kafka.Dedup
             {
                 p.Produce(topic, new() { Key = random.Next(0, 1000000).ToString(), Value = new Carrier { content = System.Text.Encoding.UTF8.GetBytes("test" + random.Next(1000000)) } });
             }
-            p.Flush(TimeSpan.FromSeconds(10));
+            p.Flush(TimeSpan.FromSeconds(60));
             Console.WriteLine("Done sending messages, gonna call it a day, have a nice day and bye!");
         }
     }

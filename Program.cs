@@ -25,7 +25,7 @@ namespace Coflnet.Kafka.Dedup
             if(args.Contains("--test"))
             {
                 await new LoadTest().Run();
-                return;
+                Console.WriteLine("continueing with deduping");
             }
 
             await new Deduper().Run(stopSource.Token);
