@@ -16,6 +16,7 @@ namespace Coflnet.Kafka.Dedup
     class Deduper
     {
         private readonly static Counter MessagesAcknowledged = Metrics.CreateCounter("deduper_acknowledged", "How many messages were acknowledged");
+        private readonly static Counter MessagesError = Metrics.CreateCounter("deduper_error", "How many messages failed to be acknowledged");
         private readonly static Counter OldMessagesDropped = Metrics.CreateCounter("deduper_dropped", "How many messages were dropped because to old");
         private readonly static Gauge CurrentOffset = Metrics.CreateGauge("dedup_consume_offset", "The consumer group offset");
 
@@ -41,6 +42,8 @@ namespace Coflnet.Kafka.Dedup
                 }
                 if (!r.Error.IsError)
                     MessagesAcknowledged.Inc();
+                else
+                    MessagesError.Inc();
             };
 
         public ConnectionMultiplexer RedisConnection { get; private set; }
@@ -241,8 +244,8 @@ namespace Coflnet.Kafka.Dedup
             {
                 if (MessagesAcknowledged.Value > acknowledgedCurrent)
                     break;
-                await Task.Delay(10);
-                if (i == 49)
+                await Task.Delay(30);
+                if (i == 99)
                 {
                     Console.WriteLine("timeout waiting for ack, aborting");
                     return;
