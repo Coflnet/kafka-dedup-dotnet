@@ -34,7 +34,7 @@ namespace Coflnet.Kafka.Dedup
                     Console.WriteLine(!r.Error.IsError
                         ? $"Delivered {r.Topic} {r.Offset} "
                         : $"\nDelivery Error {r.Topic}: {r.Error.Reason} {r.Error.IsFatal}");
-                if (r.Error.IsFatal)
+                if (r.Error.IsFatal || r.Error.Reason.Contains("Message timed out"))
                 {    
                     Console.WriteLine("Fatal error " + r.Error.Reason);
                     FatalError = true;
