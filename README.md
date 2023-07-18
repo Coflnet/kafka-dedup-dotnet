@@ -2,13 +2,18 @@
 Deduplicate a kafka topic into another topic
 
 ## Configuration
-KAFKA_HOST  
-REDIS_HOST  
-REDIS_PASSWORD  
-SOURCE_TOPIC  
-TARGET_TOPIC  
-BATCH_SIZE  (default 50)  
-~~BATCH_WAIT_TIME~~ Deprecated
+Is done via environment variables. Following options are available:
+* KAFKA__BROKERS  
+* KAFKA__TLS__CA_LOCATION
+* KAFKA__TLS__CERTIFICATE_LOCATION
+* KAFKA__TLS__KEY_LOCATION
+* KAFKA__USERNAME
+* KAFKA__PASSWORD 
+* REDIS_HOST  
+* REDIS_PASSWORD  
+* SOURCE_TOPIC  
+* TARGET_TOPIC  
+* BATCH_SIZE  (default 50)  
 
 
 ### Load test
