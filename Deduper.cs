@@ -19,6 +19,7 @@ namespace Coflnet.Kafka.Dedup
         private readonly static Counter MessagesError = Metrics.CreateCounter("deduper_error", "How many messages failed to be acknowledged");
         private readonly static Counter OldMessagesDropped = Metrics.CreateCounter("deduper_dropped", "How many messages were dropped because to old");
         private readonly static Gauge CurrentOffset = Metrics.CreateGauge("dedup_consume_offset", "The consumer group offset");
+        private static readonly TimeSpan ProcessingWindow = TimeSpan.FromHours(24);
 
         private string produceIntoTopic = SimplerConfig.Config.Instance["TARGET_TOPIC"];
         private string sourceTopic = SimplerConfig.Config.Instance["SOURCE_TOPIC"];
@@ -27,6 +28,7 @@ namespace Coflnet.Kafka.Dedup
         private static bool FatalError = false;
 
         private ConcurrentDictionary<string, DateTime> Seen = new ConcurrentDictionary<string, DateTime>();
+    private bool ForwardOnly = false;
 
 
         Action<DeliveryReport<string, Carrier>> handler = r =>
@@ -60,15 +62,38 @@ namespace Coflnet.Kafka.Dedup
 
             var db = RedisConnection.GetDatabase();
             var config = (SConfig.Instance as SConfig).AppSettings;
-            var consumerConfig = new ConsumerConfig(GetClientConfig(config.GetSection("KAFKA")))
+            
+            // Support both SOURCE_KAFKA and KAFKA (backwards compatible)
+            var sourceKafkaSection = config.GetSection("SOURCE_KAFKA");
+            if (!sourceKafkaSection.Exists())
+                sourceKafkaSection = config.GetSection("KAFKA");
+            
+            // Target Kafka can be different cluster or same as source
+            var targetKafkaSection = config.GetSection("TARGET_KAFKA");
+            if (!targetKafkaSection.Exists())
+                targetKafkaSection = sourceKafkaSection;
+            
+            // Read auto offset reset setting (default to Earliest for backwards compatibility)
+            var autoOffsetResetValue = SimplerConfig.Config.Instance["SOURCE_KAFKA__AUTO_OFFSET_RESET"] 
+                ?? SimplerConfig.Config.Instance["AUTO_OFFSET_RESET"] 
+                ?? "earliest";
+            var autoOffsetReset = autoOffsetResetValue.ToLower() == "latest" 
+                ? AutoOffsetReset.Latest 
+                : AutoOffsetReset.Earliest;
+            
+            var consumerConfig = new ConsumerConfig(GetClientConfig(sourceKafkaSection))
             {
                 GroupId = GroupId,
-                AutoOffsetReset = AutoOffsetReset.Earliest,
+                AutoOffsetReset = autoOffsetReset,
                 SessionTimeoutMs = 8000,
                 SocketTimeoutMs = 8000,
                 EnableAutoCommit = false // everything is commited explicitly
             };
-            var producerConfig = new ProducerConfig(GetClientConfig(config.GetSection("KAFKA")));
+            var producerConfig = new ProducerConfig(GetClientConfig(targetKafkaSection));
+
+            // Option to disable deduplication and forward messages as-is
+            var forwardOnlyValue = SimplerConfig.Config.Instance["FORWARD_ONLY"] ?? SimplerConfig.Config.Instance["DISABLE_DEDUP"] ?? "false";
+            ForwardOnly = forwardOnlyValue.Equals("true", StringComparison.OrdinalIgnoreCase) || forwardOnlyValue == "1";
             using (var c = new ConsumerBuilder<string, Carrier>(consumerConfig).SetValueDeserializer(Deserializer.Instance).Build())
             {
                 using (var p = new ProducerBuilder<string, Carrier>(producerConfig).SetValueSerializer(Serializer.Instance).Build())
@@ -160,7 +185,7 @@ namespace Coflnet.Kafka.Dedup
 
         private async Task ProcessBatch(IDatabase db, IConsumer<string, Carrier> c, IProducer<string, Carrier> p, List<ConsumeResult<string, Carrier>> targetBatch)
         {
-            if (targetBatch.All(m => m.Message.Timestamp.UtcDateTime < DateTime.Now - TimeSpan.FromHours(14)))
+            if (targetBatch.All(m => m.Message.Timestamp.UtcDateTime < DateTime.UtcNow - ProcessingWindow))
             {
                 a++;
                 if (a % 1000 == 0)
@@ -204,7 +229,29 @@ namespace Coflnet.Kafka.Dedup
 
         private async Task DeduplicateAndProduce(IDatabase db, IConsumer<string, Carrier> c, IProducer<string, Carrier> p, List<ConsumeResult<string, Carrier>> batch)
         {
-            var unduplicated = batch.Where(m => m.Message.Timestamp.UtcDateTime > (DateTime.Now - TimeSpan.FromHours(3)))
+            if (ForwardOnly)
+            {
+                // Forward every message directly to target topic without deduplication/storage
+                var ackBefore = MessagesAcknowledged.Value;
+                foreach (var item in batch)
+                {
+                    p.Produce(produceIntoTopic, item.Message, handler);
+                }
+
+                // Wait shortly for at least one ack (best-effort)
+                for (int i = 0; i < 50; i++)
+                {
+                    if (MessagesAcknowledged.Value > ackBefore)
+                        break;
+                    await Task.Delay(30);
+                }
+
+                // commit consumed offsets
+                ResetBatch(c, batch, ackBefore);
+                return;
+            }
+
+            var unduplicated = batch.Where(m => m.Message.Timestamp.UtcDateTime > (DateTime.UtcNow - ProcessingWindow))
                                                 .Where(m => Seen.TryAdd(m.Message.Key, DateTime.Now)).GroupBy(x => x.Message.Key).Select(y => y.First()).ToList();
             if (unduplicated.Count == 0)
             {
