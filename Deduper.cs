@@ -16,6 +16,7 @@ namespace Coflnet.Kafka.Dedup
     class Deduper
     {
         private readonly static Counter MessagesAcknowledged = Metrics.CreateCounter("deduper_acknowledged", "How many messages were acknowledged");
+        private readonly static Counter MessagesError = Metrics.CreateCounter("deduper_error", "How many messages failed to be acknowledged");
         private readonly static Counter OldMessagesDropped = Metrics.CreateCounter("deduper_dropped", "How many messages were dropped because to old");
         private readonly static Gauge CurrentOffset = Metrics.CreateGauge("dedup_consume_offset", "The consumer group offset");
 
@@ -23,6 +24,7 @@ namespace Coflnet.Kafka.Dedup
         private string sourceTopic = SimplerConfig.Config.Instance["SOURCE_TOPIC"];
         private string GroupId = SimplerConfig.Config.Instance["GROUP_ID"] ?? "deduper";
         static int batchSize = 50;
+        private static bool FatalError = false;
 
         private ConcurrentDictionary<string, DateTime> Seen = new ConcurrentDictionary<string, DateTime>();
 
@@ -32,8 +34,16 @@ namespace Coflnet.Kafka.Dedup
                 if (r.Error.IsError || r.TopicPartitionOffset.Offset % (batchSize * 10) == 0)
                     Console.WriteLine(!r.Error.IsError
                         ? $"Delivered {r.Topic} {r.Offset} "
-                        : $"\nDelivery Error {r.Topic}: {r.Error.Reason}");
-                MessagesAcknowledged.Inc();
+                        : $"\nDelivery Error {r.Topic}: {r.Error.Reason} {r.Error.IsFatal}");
+                if (r.Error.IsFatal || r.Error.Reason.Contains("Message timed out"))
+                {
+                    Console.WriteLine("Fatal error " + r.Error.Reason);
+                    FatalError = true;
+                }
+                if (!r.Error.IsError)
+                    MessagesAcknowledged.Inc();
+                else
+                    MessagesError.Inc();
             };
 
         public ConnectionMultiplexer RedisConnection { get; private set; }
@@ -54,6 +64,8 @@ namespace Coflnet.Kafka.Dedup
             {
                 GroupId = GroupId,
                 AutoOffsetReset = AutoOffsetReset.Earliest,
+                SessionTimeoutMs = 8000,
+                SocketTimeoutMs = 8000,
                 EnableAutoCommit = false // everything is commited explicitly
             };
             var producerConfig = new ProducerConfig(GetClientConfig(config.GetSection("KAFKA")));
@@ -86,6 +98,8 @@ namespace Coflnet.Kafka.Dedup
             var batch = new List<ConsumeResult<string, Carrier>>();
             while (!stopToken.IsCancellationRequested)
             {
+                if (FatalError)
+                    throw new Exception("Fatal error in kafka, abording to preserve data");
                 try
                 {
                     var next = c.Consume(stopToken);
@@ -111,7 +125,7 @@ namespace Coflnet.Kafka.Dedup
                     CurrentOffset.Set(targetBatch.Last().TopicPartitionOffset.Offset);
 
                     RemoveDupplicates(db, c, p, targetBatch);
-                    if(semaphore.CurrentCount == 0)
+                    if (semaphore.CurrentCount == 0)
                         await Task.Delay(30);
                 }
                 catch (ConsumeException e)
@@ -161,7 +175,7 @@ namespace Coflnet.Kafka.Dedup
 
             if (Seen.Count > batchSize * 20)
             {
-                if(removalLock.CurrentCount == 0)
+                if (removalLock.CurrentCount == 0)
                     return;
                 await removalLock.WaitAsync();
                 try
@@ -179,7 +193,7 @@ namespace Coflnet.Kafka.Dedup
         private void RemoveOld()
         {
 
-            // everything older than a minute has to be in redis by now
+            // everything older than 10 sec has to be in redis by now
             var toRemove = Seen.Where(s => s.Value < DateTime.Now - TimeSpan.FromSeconds(10)).Select(s => s.Key).ToList();
             foreach (var item in toRemove)
             {
@@ -209,6 +223,7 @@ namespace Coflnet.Kafka.Dedup
             if (result.Length % 2 == 1)
                 Console.WriteLine($"Get {result.Length} took {getWatch.Elapsed} {DateTime.Now}");
 
+            var acknowledgedCurrent = MessagesAcknowledged.Value;
             foreach (var item in unduplicated.Where(k => k.Message.Key == null))
             {
                 p.Produce(produceIntoTopic, item.Message, handler);
@@ -225,6 +240,17 @@ namespace Coflnet.Kafka.Dedup
                 }
             }
 
+            for (int i = 0; i < 50; i++)
+            {
+                if (MessagesAcknowledged.Value > acknowledgedCurrent)
+                    break;
+                await Task.Delay(30);
+                if (i == 99)
+                {
+                    Console.WriteLine("timeout waiting for ack, aborting");
+                    return;
+                }
+            }
 
             var watch = Stopwatch.StartNew();
             await trans.ExecuteAsync().ConfigureAwait(false);
@@ -232,7 +258,7 @@ namespace Coflnet.Kafka.Dedup
                 Console.WriteLine($"Save took {watch.Elapsed}");
 
             // tell kafka that we stored the batch
-            ResetBatch(c, batch);
+            ResetBatch(c, batch, acknowledgedCurrent);
         }
 
         public static AdminClientConfig GetClientConfig(IConfiguration config)
@@ -264,8 +290,10 @@ namespace Coflnet.Kafka.Dedup
             return baseConfig;
         }
 
-        private static void ResetBatch(IConsumer<string, Carrier> c, List<ConsumeResult<string, Carrier>> batch)
+        private static void ResetBatch(IConsumer<string, Carrier> c, List<ConsumeResult<string, Carrier>> batch, double acknowledgedCurrent = -1)
         {
+            if (acknowledgedCurrent != -1 && MessagesAcknowledged.Value <= acknowledgedCurrent)
+                return; // did not get acknowledged by broker don't commit
             c.Commit(batch.Select(b => b.TopicPartitionOffset).ToList());
             batch.Clear();
         }
