@@ -9,9 +9,10 @@ COPY . .
 RUN dotnet publish -c release -o /app
 
 # Final stage — chiseled-extra: distroless, rootless ($APP_UID), no shell/package manager.
-# "extra" adds ICU/tzdata + ca-certificates over the base chiseled image. Console app, so the
-# runtime image (not aspnet). useradd is gone because chiseled ships a non-root user already.
-FROM mcr.microsoft.com/dotnet/runtime:10.0-noble-chiseled-extra
+# "extra" adds ICU/tzdata + ca-certificates over the base chiseled image. This is a console app,
+# but the Coflnet.Core package pulls in a Microsoft.AspNetCore.App framework reference, so it
+# needs the aspnet runtime image (same base SkyApi uses), not the plain runtime one.
+FROM mcr.microsoft.com/dotnet/aspnet:10.0-noble-chiseled-extra
 WORKDIR /app
 COPY --from=build --chown=$APP_UID:$APP_UID /app ./
 
