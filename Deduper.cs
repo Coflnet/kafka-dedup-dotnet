@@ -18,6 +18,7 @@ namespace Coflnet.Kafka.Dedup
         private readonly static Counter MessagesAcknowledged = Metrics.CreateCounter("deduper_acknowledged", "How many messages were acknowledged");
         private readonly static Counter MessagesError = Metrics.CreateCounter("deduper_error", "How many messages failed to be acknowledged");
         private readonly static Counter OldMessagesDropped = Metrics.CreateCounter("deduper_dropped", "How many messages were dropped because to old");
+        private readonly static Counter MessagesSkipped = Metrics.CreateCounter("deduper_skipped", "How many messages were skipped because they could not be decoded (corrupt/undecompressable batch)");
         private readonly static Gauge CurrentOffset = Metrics.CreateGauge("dedup_consume_offset", "The consumer group offset");
 
         private string produceIntoTopic = SimplerConfig.Config.Instance["TARGET_TOPIC"];
@@ -131,6 +132,36 @@ namespace Coflnet.Kafka.Dedup
                 catch (ConsumeException e)
                 {
                     Console.WriteLine($"Error occured: {e.Error.Reason}\n{e.StackTrace}");
+
+                    // A corrupt/undecompressable batch (BadCompression/BadMsg) never advances the
+                    // consumer position: the next Consume() returns the exact same batch forever and
+                    // the partition is wedged (this is the "Decompression (codec 0x3) ... Invalid
+                    // compressed data" loop). Skip past it so the rest of the partition can flow.
+                    if (e.Error.Code == ErrorCode.Local_BadCompression || e.Error.Code == ErrorCode.Local_BadMsg)
+                    {
+                        MessagesSkipped.Inc();
+                        var failed = e.ConsumerRecord?.TopicPartitionOffset;
+                        if (failed != null)
+                        {
+                            var resumeAt = new TopicPartitionOffset(failed.TopicPartition, failed.Offset + 1);
+                            Console.WriteLine($"Skipping undecodable message at {failed}, seeking to {resumeAt.Offset}");
+                            c.Seek(resumeAt);
+                        }
+                        else
+                        {
+                            // No offset on the exception — we cannot seek precisely. The pause below
+                            // still prevents a tight loop; the partition stays put so lag keeps rising.
+                            Console.WriteLine("Undecodable message without an offset on the exception; cannot seek, pausing before retry");
+                        }
+
+                        // Deliberate throttle: one skip per minute. A single bad batch costs a minute
+                        // of latency on that partition (negligible). But if we start skipping *many*
+                        // messages — i.e. actually losing data rather than one poison batch — throughput
+                        // collapses and consumer lag climbs visibly instead of the deduper silently
+                        // burning through the log, so the loss is alertable.
+                        try { await Task.Delay(TimeSpan.FromMinutes(1), stopToken); }
+                        catch (OperationCanceledException) { }
+                    }
                 }
             }
         }
