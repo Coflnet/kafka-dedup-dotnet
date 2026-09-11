@@ -28,6 +28,8 @@ Is done via environment variables. Following options are available:
 * REDIS_PASSWORD  
 * BATCH_SIZE (default 50)
 * GROUP_ID (default: deduper)
+* SOURCE_LOOKBACK_HOURS (optional) - when set, assigned consumer partitions start at the offset closest to `now - lookback` instead of the committed/stored offset.
+* SOURCE_END_TIMESTAMP_UTC (optional) - when set, consumption stops before the first source record at or after the provided UTC timestamp.
 
 ### Backlog Recovery
 The deduper will process and forward messages up to 24 hours old. Entire batches older than 24 hours are dropped and their offsets are committed.
@@ -39,7 +41,14 @@ Messages may provide a UTF-8 `deduplication-key` header to identify duplicates i
 
 **Note:** If `TARGET_KAFKA__*` variables are not set, the application will use the same cluster as the source (backwards compatible). The original `KAFKA__*` variables are still supported for backwards compatibility.
 
-The project and Docker image target .NET 8.
+The project and Docker image target .NET 10.
+
+### Sky Bazaar Replay Prep
+To prepare a local replay of the last 24 hours from `sky-bazaar-raw` into `sky-bazaar`, run `./scripts/prepare-sky-bazaar-replay.sh`. It extracts the required Kafka credentials and TLS files from the live `kafka/dedup-sky-bazaar` deployment into `.replay/sky-bazaar/` and generates a replay env file with a unique consumer group and `SOURCE_LOOKBACK_HOURS=24`.
+
+Then start the replay with `./scripts/run-sky-bazaar-replay.sh`. The script builds the current image, starts a temporary local Redis container, mounts the extracted TLS files, and runs the deduper against the prepared env file.
+
+For other replay directories under `.replay/<name>/`, use `./scripts/run-topic-replay.sh <name>`. Set `SKIP_BUILD=true` to reuse an already built image across multiple sequential topic replays.
 
 ### Load test
 When started with the argument `--test` `MESSAGE_COUNT` messages (default 100k) will be sent to the `SOURCE_TOPIC` topic. (upper case words are environment variables)

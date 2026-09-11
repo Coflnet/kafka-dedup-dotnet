@@ -3,7 +3,7 @@ FROM mcr.microsoft.com/dotnet/sdk:10.0 AS build
 WORKDIR /build
 
 COPY kafka-dedup-dotnet.csproj .
-RUN dotnet restore
+RUN dotnet restore -p:Configuration=Release
 
 COPY . .
 RUN dotnet publish -c Release -o /app --no-restore

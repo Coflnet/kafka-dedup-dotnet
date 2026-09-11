@@ -2,6 +2,7 @@ using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Diagnostics;
+using System.Globalization;
 using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
@@ -21,15 +22,20 @@ namespace Coflnet.Kafka.Dedup
         private readonly static Counter MessagesSkipped = Metrics.CreateCounter("deduper_skipped", "How many messages were skipped because they could not be decoded (corrupt/undecompressable batch)");
         private readonly static Gauge CurrentOffset = Metrics.CreateGauge("dedup_consume_offset", "The consumer group offset");
         private static readonly TimeSpan ProcessingWindow = TimeSpan.FromHours(24);
+        private static readonly TimeSpan LookbackOffsetsTimeout = TimeSpan.FromSeconds(10);
 
-        private string produceIntoTopic = SimplerConfig.Config.Instance["TARGET_TOPIC"];
-        private string sourceTopic = SimplerConfig.Config.Instance["SOURCE_TOPIC"];
-        private string GroupId = SimplerConfig.Config.Instance["GROUP_ID"] ?? "deduper";
+        private string produceIntoTopic = GetSetting("TARGET_TOPIC");
+        private string sourceTopic = GetSetting("SOURCE_TOPIC");
+        private string GroupId = GetSetting("GROUP_ID") ?? "deduper";
         static int batchSize = 50;
         private static bool FatalError = false;
+        private DateTime? replayEndTimestampUtc;
 
         private ConcurrentDictionary<string, DateTime> Seen = new ConcurrentDictionary<string, DateTime>();
-    private bool ForwardOnly = false;
+        private ConcurrentDictionary<TopicPartition, Offset> ReplayEndOffsets = new ConcurrentDictionary<TopicPartition, Offset>();
+        private ConcurrentDictionary<TopicPartition, byte> CompletedReplayPartitions = new ConcurrentDictionary<TopicPartition, byte>();
+        private List<Task> InFlightBatches = new List<Task>();
+        private bool ForwardOnly = false;
 
 
         Action<DeliveryReport<string, Carrier>> handler = r =>
@@ -53,30 +59,36 @@ namespace Coflnet.Kafka.Dedup
         public async Task Run(CancellationToken stopToken)
         {
             Console.WriteLine("starting");
-            if (int.TryParse(SimplerConfig.Config.Instance["BATCH_SIZE"], out int size))
+            if (int.TryParse(GetSetting("BATCH_SIZE"), out int size))
                 batchSize = size;
 
-            ConfigurationOptions options = ConfigurationOptions.Parse(SimplerConfig.Config.Instance["REDIS_HOST"]);
-            options.Password = SimplerConfig.Config.Instance["REDIS_PASSWORD"];
+            ConfigurationOptions options = ConfigurationOptions.Parse(GetRequiredSetting("REDIS_HOST"));
+            options.Password = GetSetting("REDIS_PASSWORD");
             //options.AsyncTimeout = 200;
             RedisConnection = ConnectionMultiplexer.Connect(options);
 
             var db = RedisConnection.GetDatabase();
-            var config = (SConfig.Instance as SConfig).AppSettings;
+            var appSettings = (SConfig.Instance as SConfig)?.AppSettings;
+            var configBuilder = new ConfigurationBuilder();
+            if (appSettings != null)
+                configBuilder.AddConfiguration(appSettings);
+
+            configBuilder.AddEnvironmentVariables();
+            var config = configBuilder.Build();
             
             // Support both SOURCE_KAFKA and KAFKA (backwards compatible)
             var sourceKafkaSection = config.GetSection("SOURCE_KAFKA");
-            if (!sourceKafkaSection.Exists())
+            if (!sourceKafkaSection.Exists() || string.IsNullOrWhiteSpace(sourceKafkaSection["BROKERS"]))
                 sourceKafkaSection = config.GetSection("KAFKA");
             
             // Target Kafka can be different cluster or same as source
             var targetKafkaSection = config.GetSection("TARGET_KAFKA");
-            if (!targetKafkaSection.Exists())
+            if (!targetKafkaSection.Exists() || string.IsNullOrWhiteSpace(targetKafkaSection["BROKERS"]))
                 targetKafkaSection = sourceKafkaSection;
             
             // Read auto offset reset setting (default to Earliest for backwards compatibility)
-            var autoOffsetResetValue = SimplerConfig.Config.Instance["SOURCE_KAFKA__AUTO_OFFSET_RESET"] 
-                ?? SimplerConfig.Config.Instance["AUTO_OFFSET_RESET"] 
+            var autoOffsetResetValue = GetSetting("SOURCE_KAFKA__AUTO_OFFSET_RESET") 
+                ?? GetSetting("AUTO_OFFSET_RESET") 
                 ?? "earliest";
             var autoOffsetReset = autoOffsetResetValue.ToLower() == "latest" 
                 ? AutoOffsetReset.Latest 
@@ -93,9 +105,28 @@ namespace Coflnet.Kafka.Dedup
             var producerConfig = new ProducerConfig(GetClientConfig(targetKafkaSection));
 
             // Option to disable deduplication and forward messages as-is
-            var forwardOnlyValue = SimplerConfig.Config.Instance["FORWARD_ONLY"] ?? SimplerConfig.Config.Instance["DISABLE_DEDUP"] ?? "false";
+            var forwardOnlyValue = GetSetting("FORWARD_ONLY") ?? GetSetting("DISABLE_DEDUP") ?? "false";
             ForwardOnly = forwardOnlyValue.Equals("true", StringComparison.OrdinalIgnoreCase) || forwardOnlyValue == "1";
-            using (var c = new ConsumerBuilder<string, Carrier>(consumerConfig).SetValueDeserializer(Deserializer.Instance).Build())
+            var consumerBuilder = new ConsumerBuilder<string, Carrier>(consumerConfig)
+                .SetValueDeserializer(Deserializer.Instance);
+            var hasSourceLookback = TryGetSourceLookback(out var sourceLookback);
+            var hasReplayEndTimestamp = TryGetSourceEndTimestamp(out var configuredReplayEndTimestampUtc);
+            replayEndTimestampUtc = hasReplayEndTimestamp ? configuredReplayEndTimestampUtc : null;
+
+            if (hasSourceLookback && hasReplayEndTimestamp)
+            {
+                consumerBuilder.SetPartitionsAssignedHandler((consumer, partitions) => ResolveReplayAssignments(consumer, partitions, sourceLookback, configuredReplayEndTimestampUtc));
+            }
+            else if (hasSourceLookback)
+            {
+                consumerBuilder.SetPartitionsAssignedHandler((consumer, partitions) => ResolveReplayOffsets(consumer, partitions, sourceLookback));
+            }
+            else if (hasReplayEndTimestamp)
+            {
+                consumerBuilder.SetPartitionsAssignedHandler((consumer, partitions) => ConfigureReplayEndOffsets(consumer, partitions, configuredReplayEndTimestampUtc));
+            }
+
+            using (var c = consumerBuilder.Build())
             {
                 using (var p = new ProducerBuilder<string, Carrier>(producerConfig).SetValueSerializer(Serializer.Instance).Build())
                 {
@@ -108,12 +139,125 @@ namespace Coflnet.Kafka.Dedup
                     catch (OperationCanceledException)
                     {
                     }
-                    // Ensure the consumer leaves the group cleanly and final offsets are committed.
-                    c.Close();
-                    p.Flush();
+                    if (replayEndTimestampUtc.HasValue && HasReachedReplayEnd())
+                        Console.WriteLine("Replay cutoff reached. Skipping consumer close because offsets were already committed during batch processing.");
+                    else
+                    {
+                        Console.WriteLine("Closing consumer.");
+                        c.Close();
+                    }
+
+                    Console.WriteLine("Flushing producer.");
+                    var remainingMessages = p.Flush(TimeSpan.FromSeconds(15));
+                    Console.WriteLine($"Producer flush complete. Remaining messages: {remainingMessages}.");
                     Console.WriteLine("stopping");
                 }
             }
+        }
+
+        private static bool TryGetSourceLookback(out TimeSpan sourceLookback)
+        {
+            sourceLookback = default;
+            var configuredValue = GetSetting("SOURCE_LOOKBACK_HOURS")
+                ?? GetSetting("REPLAY_LOOKBACK_HOURS");
+
+            if (string.IsNullOrWhiteSpace(configuredValue))
+                return false;
+
+            if (!double.TryParse(configuredValue, out var lookbackHours) || lookbackHours <= 0)
+                throw new InvalidOperationException($"Invalid SOURCE_LOOKBACK_HOURS value '{configuredValue}'. Expected a positive number of hours.");
+
+            sourceLookback = TimeSpan.FromHours(lookbackHours);
+            Console.WriteLine($"Starting source consumption {sourceLookback.TotalHours:0.##} hours back.");
+            return true;
+        }
+
+        private static bool TryGetSourceEndTimestamp(out DateTime sourceEndTimestampUtc)
+        {
+            sourceEndTimestampUtc = default;
+            var configuredValue = GetSetting("SOURCE_END_TIMESTAMP_UTC")
+                ?? GetSetting("REPLAY_END_TIMESTAMP_UTC");
+
+            if (string.IsNullOrWhiteSpace(configuredValue))
+                return false;
+
+            if (!DateTimeOffset.TryParse(configuredValue, CultureInfo.InvariantCulture, DateTimeStyles.AssumeUniversal | DateTimeStyles.AdjustToUniversal, out var parsedValue))
+                throw new InvalidOperationException($"Invalid SOURCE_END_TIMESTAMP_UTC value '{configuredValue}'. Expected an ISO-8601 UTC timestamp.");
+
+            sourceEndTimestampUtc = parsedValue.UtcDateTime;
+            Console.WriteLine($"Stopping source consumption at {sourceEndTimestampUtc:o}.");
+            return true;
+        }
+
+        private static string GetRequiredSetting(string key)
+        {
+            var value = GetSetting(key);
+            if (string.IsNullOrWhiteSpace(value))
+                throw new InvalidOperationException($"Missing required configuration value '{key}'.");
+
+            return value;
+        }
+
+        private static string GetSetting(string key)
+        {
+            try
+            {
+                var simplerConfigValue = SimplerConfig.Config.Instance[key];
+                if (!string.IsNullOrWhiteSpace(simplerConfigValue))
+                    return simplerConfigValue;
+            }
+            catch
+            {
+            }
+
+            return Environment.GetEnvironmentVariable(key);
+        }
+
+        private static IEnumerable<TopicPartitionOffset> ResolveReplayOffsets(IConsumer<string, Carrier> consumer, List<TopicPartition> partitions, TimeSpan sourceLookback)
+        {
+            var replayStart = DateTime.UtcNow - sourceLookback;
+            var requestedOffsets = partitions
+                .Select(partition => new TopicPartitionTimestamp(partition, new Timestamp(replayStart)))
+                .ToList();
+            var resolvedOffsets = consumer.OffsetsForTimes(requestedOffsets, LookbackOffsetsTimeout);
+
+            Console.WriteLine($"Assigned {partitions.Count} partitions from {replayStart:o}.");
+
+            return resolvedOffsets.Select(offset =>
+            {
+                if (offset.Offset == Offset.Unset)
+                    return new TopicPartitionOffset(offset.TopicPartition, Offset.Beginning);
+
+                return offset;
+            });
+        }
+
+        private IEnumerable<TopicPartitionOffset> ResolveReplayAssignments(IConsumer<string, Carrier> consumer, List<TopicPartition> partitions, TimeSpan sourceLookback, DateTime sourceEndTimestampUtc)
+        {
+            ConfigureReplayEndOffsets(consumer, partitions, sourceEndTimestampUtc);
+            return ResolveReplayOffsets(consumer, partitions, sourceLookback);
+        }
+
+        private void ConfigureReplayEndOffsets(IConsumer<string, Carrier> consumer, List<TopicPartition> partitions, DateTime sourceEndTimestampUtc)
+        {
+            ReplayEndOffsets.Clear();
+            CompletedReplayPartitions.Clear();
+
+            var requestedOffsets = partitions
+                .Select(partition => new TopicPartitionTimestamp(partition, new Timestamp(sourceEndTimestampUtc)))
+                .ToList();
+            var resolvedOffsets = consumer.OffsetsForTimes(requestedOffsets, LookbackOffsetsTimeout);
+
+            foreach (var resolvedOffset in resolvedOffsets)
+            {
+                var replayEndOffset = resolvedOffset.Offset;
+                if (replayEndOffset == Offset.Unset)
+                    replayEndOffset = consumer.QueryWatermarkOffsets(resolvedOffset.TopicPartition, LookbackOffsetsTimeout).High;
+
+                ReplayEndOffsets[resolvedOffset.TopicPartition] = replayEndOffset;
+            }
+
+            Console.WriteLine($"Will stop {partitions.Count} partitions at {sourceEndTimestampUtc:o}.");
         }
 
         private string lastKey;
@@ -128,10 +272,19 @@ namespace Coflnet.Kafka.Dedup
                     throw new Exception("Fatal error in kafka, abording to preserve data");
                 try
                 {
-                    var next = c.Consume(stopToken);
-                    if (next != null)
-                        batch.Add(next);
-                    while (batch.Count < batchSize)
+                    if (HasReachedReplayEnd())
+                        break;
+
+                    TryCompleteReplayPartitions(c);
+                    if (HasReachedReplayEnd())
+                        break;
+
+                    var next = c.Consume(TimeSpan.FromSeconds(1));
+                    if (stopToken.IsCancellationRequested)
+                        break;
+
+                    TryAddToBatch(c, batch, next);
+                    while (batch.Count < batchSize && !HasReachedReplayEnd())
                     {
                         var cr = c.Consume(TimeSpan.Zero);
                         if (cr == null)
@@ -139,18 +292,27 @@ namespace Coflnet.Kafka.Dedup
                             break;
                         }
 
-                        batch.Add(cr);
-                        if (cr.TopicPartitionOffset.Offset % (batchSize * 10) == 0)
+                        var addedToBatch = TryAddToBatch(c, batch, cr);
+                        if (addedToBatch && cr.TopicPartitionOffset.Offset % (batchSize * 10) == 0)
                             Console.WriteLine($"Consumed message '{cr.Message.Key}' at: '{cr.TopicPartitionOffset}'.");
                     }
                     if (batch.Count == 0)
+                    {
+                        if (HasReachedReplayEnd())
+                            break;
+
+                        TryCompleteReplayPartitions(c);
+                        if (HasReachedReplayEnd())
+                            break;
+
                         continue;
+                    }
 
                     var targetBatch = batch;
                     batch = new List<ConsumeResult<string, Carrier>>();
                     CurrentOffset.Set(targetBatch.Last().TopicPartitionOffset.Offset);
 
-                    RemoveDupplicates(db, c, p, targetBatch);
+                    TrackInFlightBatch(RemoveDupplicates(db, c, p, targetBatch));
                     if (semaphore.CurrentCount == 0)
                         await Task.Delay(30);
                 }
@@ -189,12 +351,19 @@ namespace Coflnet.Kafka.Dedup
                     }
                 }
             }
+
+            if (HasReachedReplayEnd() && replayEndTimestampUtc.HasValue)
+                Console.WriteLine($"Reached replay cutoff {replayEndTimestampUtc.Value:o}. Waiting for in-flight batches to finish.");
+
+            await WaitForInFlightBatches();
+            Console.WriteLine("Finished waiting for in-flight batches.");
         }
         SemaphoreSlim semaphore = new SemaphoreSlim(20);
         SemaphoreSlim removalLock = new SemaphoreSlim(1);
-        private void RemoveDupplicates(IDatabase db, IConsumer<string, Carrier> c, IProducer<string, Carrier> p, List<ConsumeResult<string, Carrier>> targetBatch)
+        SemaphoreSlim commitLock = new SemaphoreSlim(1);
+        private Task RemoveDupplicates(IDatabase db, IConsumer<string, Carrier> c, IProducer<string, Carrier> p, List<ConsumeResult<string, Carrier>> targetBatch)
         {
-            _ = Task.Run(async () =>
+            return Task.Run(async () =>
             {
                 for (int i = 0; i < 3; i++)
                     try
@@ -211,7 +380,84 @@ namespace Coflnet.Kafka.Dedup
                     {
                         semaphore.Release();
                     }
-            }).ConfigureAwait(false);
+            });
+        }
+
+        private bool TryAddToBatch(IConsumer<string, Carrier> consumer, List<ConsumeResult<string, Carrier>> batch, ConsumeResult<string, Carrier> consumeResult)
+        {
+            if (consumeResult == null)
+                return false;
+
+            if (!ShouldProcessConsumeResult(consumer, consumeResult))
+                return false;
+
+            batch.Add(consumeResult);
+            return true;
+        }
+
+        private bool ShouldProcessConsumeResult(IConsumer<string, Carrier> consumer, ConsumeResult<string, Carrier> consumeResult)
+        {
+            if (!ReplayEndOffsets.TryGetValue(consumeResult.TopicPartition, out var replayEndOffset))
+                return true;
+
+            if (consumeResult.Offset < replayEndOffset)
+                return true;
+
+            MarkReplayPartitionComplete(consumer, consumeResult.TopicPartition, consumeResult.Offset, replayEndOffset);
+
+            return false;
+        }
+
+        private void TryCompleteReplayPartitions(IConsumer<string, Carrier> consumer)
+        {
+            if (ReplayEndOffsets.Count == 0)
+                return;
+
+            var assignedPartitions = consumer.Assignment;
+            if (assignedPartitions == null || assignedPartitions.Count == 0)
+                return;
+
+            foreach (var topicPartition in assignedPartitions)
+            {
+                var position = new TopicPartitionOffset(topicPartition, consumer.Position(topicPartition));
+                if (!ReplayEndOffsets.TryGetValue(position.TopicPartition, out var replayEndOffset))
+                    continue;
+
+                if (position.Offset == Offset.Unset || position.Offset < replayEndOffset)
+                    continue;
+
+                MarkReplayPartitionComplete(consumer, position.TopicPartition, position.Offset, replayEndOffset);
+            }
+        }
+
+        private void MarkReplayPartitionComplete(IConsumer<string, Carrier> consumer, TopicPartition topicPartition, Offset currentOffset, Offset replayEndOffset)
+        {
+            if (!CompletedReplayPartitions.TryAdd(topicPartition, 0))
+                return;
+
+            consumer.Pause(new[] { topicPartition });
+            Console.WriteLine($"Reached replay end for {topicPartition} at position {currentOffset} (target {replayEndOffset}).");
+        }
+
+        private bool HasReachedReplayEnd()
+        {
+            return ReplayEndOffsets.Count > 0 && CompletedReplayPartitions.Count == ReplayEndOffsets.Count;
+        }
+
+        private void TrackInFlightBatch(Task batchTask)
+        {
+            InFlightBatches.RemoveAll(task => task.IsCompleted);
+            InFlightBatches.Add(batchTask);
+        }
+
+        private async Task WaitForInFlightBatches()
+        {
+            InFlightBatches.RemoveAll(task => task.IsCompleted);
+            if (InFlightBatches.Count == 0)
+                return;
+
+            await Task.WhenAll(InFlightBatches);
+            InFlightBatches.Clear();
         }
 
         private async Task ProcessBatch(IDatabase db, IConsumer<string, Carrier> c, IProducer<string, Carrier> p, List<ConsumeResult<string, Carrier>> targetBatch)
@@ -223,7 +469,7 @@ namespace Coflnet.Kafka.Dedup
                     Console.WriteLine("1k dropped");
                 OldMessagesDropped.Inc(targetBatch.Count);
                 // tell kafka that we processed this batch
-                ResetBatch(c, targetBatch);
+                await CommitBatch(c, targetBatch);
                 return;
             }
             await DeduplicateAndProduce(db, c, p, targetBatch);
@@ -285,7 +531,7 @@ namespace Coflnet.Kafka.Dedup
                 }
 
                 // commit consumed offsets
-                ResetBatch(c, batch, ackBefore);
+                await CommitBatch(c, batch, ackBefore);
                 return;
             }
 
@@ -299,7 +545,7 @@ namespace Coflnet.Kafka.Dedup
                     Console.WriteLine("skip because duplicate " + lastKey);
                 }
 
-                ResetBatch(c, batch);
+                await CommitBatch(c, batch);
                 return;// no new keys
                 //continue; 
             }
@@ -343,7 +589,7 @@ namespace Coflnet.Kafka.Dedup
                 Console.WriteLine($"Save took {watch.Elapsed}");
 
             // tell kafka that we stored the batch
-            ResetBatch(c, batch, acknowledgedCurrent);
+            await CommitBatch(c, batch, acknowledgedCurrent);
         }
 
         public static AdminClientConfig GetClientConfig(IConfiguration config)
@@ -381,6 +627,19 @@ namespace Coflnet.Kafka.Dedup
                 return; // did not get acknowledged by broker don't commit
             c.Commit(batch.Select(b => b.TopicPartitionOffset).ToList());
             batch.Clear();
+        }
+
+        private async Task CommitBatch(IConsumer<string, Carrier> c, List<ConsumeResult<string, Carrier>> batch, double acknowledgedCurrent = -1)
+        {
+            await commitLock.WaitAsync();
+            try
+            {
+                ResetBatch(c, batch, acknowledgedCurrent);
+            }
+            finally
+            {
+                commitLock.Release();
+            }
         }
     }
 }
