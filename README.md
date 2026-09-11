@@ -33,6 +33,8 @@ Is done via environment variables. Following options are available:
 The deduper will process and forward messages up to 24 hours old. Entire batches older than 24 hours are dropped and their offsets are committed.
 
 ### Forwarding
+Messages may provide a UTF-8 `deduplication-key` header to identify duplicates independently of the Kafka key. Without it, the Kafka key remains the duplicate identity. Forwarding preserves the original key and headers, allowing sales of the same item to share a partition while distinct auction UUIDs remain distinct events. Deploy this deduper version before enabling producers that use this header.
+
 * FORWARD_ONLY (optional, default: false) - when set to true the application will skip deduplication and forward every consumed message to the target topic. Useful for migration or simple forwarding use-cases.
 
 **Note:** If `TARGET_KAFKA__*` variables are not set, the application will use the same cluster as the source (backwards compatible). The original `KAFKA__*` variables are still supported for backwards compatibility.

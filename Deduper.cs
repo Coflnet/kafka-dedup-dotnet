@@ -227,6 +227,13 @@ namespace Coflnet.Kafka.Dedup
             Console.WriteLine("Removed " + toRemove.Count);
         }
 
+        internal static string GetDeduplicationKey(Message<string, Carrier> message)
+        {
+            if (message.Headers != null && message.Headers.TryGetLastBytes("deduplication-key", out var key) && key != null)
+                return System.Text.Encoding.UTF8.GetString(key);
+            return message.Key;
+        }
+
         private async Task DeduplicateAndProduce(IDatabase db, IConsumer<string, Carrier> c, IProducer<string, Carrier> p, List<ConsumeResult<string, Carrier>> batch)
         {
             if (ForwardOnly)
@@ -252,7 +259,7 @@ namespace Coflnet.Kafka.Dedup
             }
 
             var unduplicated = batch.Where(m => m.Message.Timestamp.UtcDateTime > (DateTime.UtcNow - ProcessingWindow))
-                                                .Where(m => Seen.TryAdd(m.Message.Key, DateTime.Now)).GroupBy(x => x.Message.Key).Select(y => y.First()).ToList();
+                                                .Where(m => Seen.TryAdd(GetDeduplicationKey(m.Message), DateTime.Now)).GroupBy(x => GetDeduplicationKey(x.Message)).Select(y => y.First()).ToList();
             if (unduplicated.Count == 0)
             {
                 if (batch.Count > 0 && lastKey != batch.First().Message.Key)
@@ -266,12 +273,12 @@ namespace Coflnet.Kafka.Dedup
                 //continue; 
             }
             var getWatch = Stopwatch.StartNew();
-            var result = await db.StringGetAsync(unduplicated.Where(k => k.Message.Key != null).Select(s => new RedisKey(s.Message.Key)).ToArray()).ConfigureAwait(false);
+            var result = await db.StringGetAsync(unduplicated.Where(k => GetDeduplicationKey(k.Message) != null).Select(s => new RedisKey(GetDeduplicationKey(s.Message))).ToArray()).ConfigureAwait(false);
             if (result.Length % 2 == 1)
                 Console.WriteLine($"Get {result.Length} took {getWatch.Elapsed} {DateTime.Now}");
 
             var acknowledgedCurrent = MessagesAcknowledged.Value;
-            foreach (var item in unduplicated.Where(k => k.Message.Key == null))
+            foreach (var item in unduplicated.Where(k => GetDeduplicationKey(k.Message) == null))
             {
                 p.Produce(produceIntoTopic, item.Message, handler);
             }
@@ -283,7 +290,7 @@ namespace Coflnet.Kafka.Dedup
                 {
                     var value = unduplicated[i];
                     p.Produce(produceIntoTopic, value.Message, handler);
-                    _ = trans.StringSetAsync(value.Message.Key, "1", TimeSpan.FromSeconds(3600)).ConfigureAwait(false);
+                    _ = trans.StringSetAsync(GetDeduplicationKey(value.Message), "1", TimeSpan.FromSeconds(3600)).ConfigureAwait(false);
                 }
             }
 
