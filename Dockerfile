@@ -1,5 +1,5 @@
 # First stage
-FROM mcr.microsoft.com/dotnet/sdk:8.0 AS build
+FROM mcr.microsoft.com/dotnet/sdk:10.0 AS build
 WORKDIR /build
 
 COPY kafka-dedup-dotnet.csproj .
@@ -8,11 +8,18 @@ RUN dotnet restore
 COPY . .
 RUN dotnet publish -c Release -o /app --no-restore
 
-# Final stage
-FROM mcr.microsoft.com/dotnet/runtime:8.0
+# Final stage — chiseled-extra: distroless, rootless ($APP_UID), no shell/package manager.
+# "extra" adds ICU/tzdata + ca-certificates over the base chiseled image. This is a console app,
+# but the Coflnet.Core package pulls in a Microsoft.AspNetCore.App framework reference, so it
+# needs the aspnet runtime image (same base SkyApi uses), not the plain runtime one.
+FROM mcr.microsoft.com/dotnet/aspnet:10.0-noble-chiseled-extra
 WORKDIR /app
-COPY --from=build /app ./
+COPY --from=build --chown=$APP_UID:$APP_UID /app ./
 
-USER app
+ENV DOTNET_RUNNING_IN_CONTAINER=true \
+    HOME=/tmp \
+    TMPDIR=/tmp
+
+USER $APP_UID
 
 ENTRYPOINT ["dotnet", "kafka-dedup-dotnet.dll"]
